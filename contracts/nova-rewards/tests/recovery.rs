@@ -64,7 +64,7 @@ fn test_snapshot_and_restore_account_state() {
 
     let snapshot = client.snapshot_account(&user, &operation_id(&env, 1));
     assert_eq!(snapshot.balance, 600);
-    assert_eq!(snapshot.stake.unwrap().amount, 400);
+    assert_eq!(snapshot.stake.into_option().unwrap().amount, 400);
 
     client.pause(&Symbol::new(&env, "restore"));
     client.recover_transaction(&user, &150_i128, &operation_id(&env, 2));
