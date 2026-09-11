@@ -15,7 +15,7 @@ use soroban_sdk::{
     vec, Address, Env,
 };
 
-use admin_roles::{AdminRolesContract, AdminRolesContractClient};
+use admin_roles::{AdminRolesContract, AdminRolesContractClient, Error as AdminRolesError};
 use nova_token::{NovaToken, NovaTokenClient};
 use referral::{ReferralContract, ReferralContractClient};
 use reward_pool::{RewardPool, RewardPoolClient};
@@ -189,7 +189,7 @@ fn test_admin_multisig_config() {
     let s1 = Address::generate(&s.env);
     let s2 = Address::generate(&s.env);
 
-    s.admin_roles.update_signers(&vec![&s.env, s1, s2]);
+    s.admin_roles.update_signers(&s.admin, &vec![&s.env, s1, s2]);
     s.admin_roles.update_threshold(&2);
 
     assert_eq!(s.admin_roles.get_threshold(), 2);
@@ -303,11 +303,15 @@ fn test_pool_double_init_rejected() {
 }
 
 #[test]
-#[should_panic(expected = "already initialised")]
 fn test_admin_roles_double_init_rejected() {
     let s = setup();
     let other = Address::generate(&s.env);
-    s.admin_roles.initialize(&other, &vec![&s.env], &1);
+    let err = s
+        .admin_roles
+        .try_initialize(&other, &vec![&s.env], &1)
+        .unwrap_err()
+        .unwrap();
+    assert_eq!(err, AdminRolesError::AlreadyInitialized);
 }
 
 #[test]

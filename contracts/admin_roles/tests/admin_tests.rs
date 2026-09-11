@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use admin_roles::{AdminRolesContract, AdminRolesContractClient, Error, Role};
-use soroban_sdk::{testutils::Address as _, vec, Address, Env};
+use soroban_sdk::{
+    testutils::{Address as _, Events as _},
+    vec, Address, Env,
+};
 
 fn setup() -> (Env, Address, AdminRolesContractClient<'static>) {
     let env = Env::default();
@@ -9,7 +12,7 @@ fn setup() -> (Env, Address, AdminRolesContractClient<'static>) {
     let id = env.register(AdminRolesContract, ());
     let client = AdminRolesContractClient::new(&env, &id);
     let owner = Address::generate(&env);
-    client.initialize(&owner, &vec![&env], &1).unwrap();
+    client.initialize(&owner, &vec![&env], &1);
     (env, owner, client)
 }
 
@@ -17,7 +20,7 @@ fn setup() -> (Env, Address, AdminRolesContractClient<'static>) {
 
 #[test]
 fn initialize_sets_owner_and_threshold() {
-    let (env, owner, client) = setup();
+    let (_env, owner, client) = setup();
     assert_eq!(client.get_admin(), owner);
     assert_eq!(client.get_threshold(), 1);
     assert!(client.has_role(&owner, &Role::Admin));
@@ -36,7 +39,7 @@ fn initialize_twice_returns_error() {
 fn grant_merchant_role() {
     let (env, _owner, client) = setup();
     let merchant = Address::generate(&env);
-    client.grant_role(&merchant, &Role::Merchant).unwrap();
+    client.grant_role(&merchant, &Role::Merchant);
     assert!(client.has_role(&merchant, &Role::Merchant));
 }
 
@@ -44,8 +47,8 @@ fn grant_merchant_role() {
 fn revoke_merchant_role() {
     let (env, _owner, client) = setup();
     let merchant = Address::generate(&env);
-    client.grant_role(&merchant, &Role::Merchant).unwrap();
-    client.revoke_role(&merchant, &Role::Merchant).unwrap();
+    client.grant_role(&merchant, &Role::Merchant);
+    client.revoke_role(&merchant, &Role::Merchant);
     assert!(!client.has_role(&merchant, &Role::Merchant));
 }
 
@@ -53,7 +56,7 @@ fn revoke_merchant_role() {
 fn grant_operator_role() {
     let (env, _owner, client) = setup();
     let op = Address::generate(&env);
-    client.grant_role(&op, &Role::Operator).unwrap();
+    client.grant_role(&op, &Role::Operator);
     assert!(client.has_role(&op, &Role::Operator));
 }
 
@@ -108,7 +111,7 @@ fn grant_role_by_non_owner_rejected() {
     // the owner check uses require_owner which checks the stored owner.
     // We verify the happy path here since mock_all_auths is active.
     let account = Address::generate(&env);
-    client.grant_role(&account, &Role::Admin).unwrap();
+    client.grant_role(&account, &Role::Admin);
     assert!(client.has_role(&account, &Role::Admin));
 }
 
@@ -118,7 +121,7 @@ fn grant_role_by_non_owner_rejected() {
 fn mint_with_admin_role_succeeds() {
     let (env, owner, client) = setup();
     let target = Address::generate(&env);
-    client.mint(&owner, &target, &500).unwrap();
+    client.mint(&owner, &target, &500);
 }
 
 #[test]
@@ -126,24 +129,24 @@ fn withdraw_with_operator_role_succeeds() {
     let (env, _owner, client) = setup();
     let op = Address::generate(&env);
     let target = Address::generate(&env);
-    client.grant_role(&op, &Role::Operator).unwrap();
-    client.withdraw(&op, &target, &200).unwrap();
+    client.grant_role(&op, &Role::Operator);
+    client.withdraw(&op, &target, &200);
 }
 
 #[test]
 fn update_rate_with_merchant_role_succeeds() {
     let (env, _owner, client) = setup();
     let merchant = Address::generate(&env);
-    client.grant_role(&merchant, &Role::Merchant).unwrap();
-    client.update_rate(&merchant, &15).unwrap();
+    client.grant_role(&merchant, &Role::Merchant);
+    client.update_rate(&merchant, &15);
 }
 
 #[test]
 fn pause_with_operator_role_succeeds() {
     let (env, _owner, client) = setup();
     let op = Address::generate(&env);
-    client.grant_role(&op, &Role::Operator).unwrap();
-    client.pause(&op).unwrap();
+    client.grant_role(&op, &Role::Operator);
+    client.pause(&op);
 }
 
 // ── Two-step transfer ─────────────────────────────────────────────────────────
@@ -152,8 +155,8 @@ fn pause_with_operator_role_succeeds() {
 fn two_step_transfer_works() {
     let (env, _owner, client) = setup();
     let new_owner = Address::generate(&env);
-    client.propose_admin(&new_owner).unwrap();
-    client.accept_admin().unwrap();
+    client.propose_admin(&new_owner);
+    client.accept_admin();
     assert_eq!(client.get_admin(), new_owner);
     assert!(client.has_role(&new_owner, &Role::Admin));
 }
@@ -171,15 +174,16 @@ fn accept_without_proposal_rejected() {
 fn role_granted_event_emitted() {
     let (env, _owner, client) = setup();
     let account = Address::generate(&env);
-    client.grant_role(&account, &Role::Merchant).unwrap();
-    assert!(!env.events().all().is_empty());
+    client.grant_role(&account, &Role::Merchant);
+    assert!(!env.events().all().events().is_empty());
 }
 
 #[test]
 fn role_revoked_event_emitted() {
     let (env, _owner, client) = setup();
     let account = Address::generate(&env);
-    client.grant_role(&account, &Role::Operator).unwrap();
-    client.revoke_role(&account, &Role::Operator).unwrap();
-    assert!(env.events().all().len() >= 2);
+    client.grant_role(&account, &Role::Operator);
+    client.revoke_role(&account, &Role::Operator);
+    // events().all() only holds the last invocation's events, i.e. the revoke.
+    assert!(!env.events().all().events().is_empty());
 }
