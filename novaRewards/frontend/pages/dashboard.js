@@ -9,6 +9,7 @@ import ErrorBoundary from "../components/ErrorBoundary";
 import Navbar from "../components/Navbar";
 import { truncateAddress } from "../lib/truncateAddress";
 import { formatTokenAmount } from "../lib/formatting";
+import Link from 'next/link';
 
 /**
  * Customer dashboard — balance, transaction history, trustline, transfer, redeem.
@@ -55,7 +56,7 @@ function DashboardContent() {
           <span className="text-neutral-400 text-sm">
             {shortKey}
           </span>
-          <a href="/monitoring" className="text-sm">Monitoring</a>
+          <Link href="/monitoring" className="text-sm">Monitoring</Link>
           <button
             className="btn btn-secondary px-4 py-1.5"
             onClick={disconnect}
@@ -102,9 +103,9 @@ function DashboardContent() {
                     <p className="text-neutral-400 mb-3">
                       No transactions yet. Start earning NOVA rewards!
                     </p>
-                    <a href="/merchant" className="text-primary-600 font-semibold">
+                    <Link href="/merchant" className="text-primary-600 font-semibold">
                       Browse merchants →
-                    </a>
+                    </Link>
                   </div>
                 ) : (
                   <div className="table-scroll">

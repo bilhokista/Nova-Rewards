@@ -151,6 +151,8 @@ export default function ErrorDisplay({
               )}
 
               {/* Home link */}
+              {/* Full reload on purpose: the app tree just crashed, so client-side routing is not trusted. */}
+              {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
               <a
                 href="/"
                 className="px-6 py-3 bg-gray-200 hover:bg-gray-300 dark:bg-gray-600 dark:hover:bg-gray-500 text-gray-900 dark:text-white font-semibold rounded-lg transition-colors touch-target text-center"

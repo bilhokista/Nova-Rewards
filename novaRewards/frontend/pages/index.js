@@ -2,6 +2,7 @@ import { useWallet } from '../context/WalletContext';
 import { useRouter } from 'next/router';
 import { useEffect } from 'react';
 import Navbar from '../components/Navbar';
+import Link from 'next/link';
 
 export async function getServerSideProps() {
   return { props: {} };
@@ -25,8 +26,8 @@ export default function Home() {
       <nav className="nav">
         <span className="nav-brand">⭐ NovaRewards</span>
         <div className="nav-links">
-          <a href="/merchant">Merchant Portal</a>
-          <a href="/monitoring">Monitoring</a>
+          <Link href="/merchant">Merchant Portal</Link>
+          <Link href="/monitoring">Monitoring</Link>
           {publicKey && (
             <button
               className="btn btn-secondary"

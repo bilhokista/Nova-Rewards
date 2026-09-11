@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import api from "../lib/api";
 import ErrorBoundary from "../components/ErrorBoundary";
+import Link from 'next/link';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -256,11 +257,11 @@ function MonitoringContent() {
       <nav className="nav">
         <span className="nav-brand">⭐ NovaRewards</span>
         <div className="nav-links">
-          <a href="/">Customer</a>
-          <a href="/merchant">Merchant</a>
-          <a href="/monitoring" style={{ color: "var(--accent)", fontWeight: 700 }}>
+          <Link href="/">Customer</Link>
+          <Link href="/merchant">Merchant</Link>
+          <Link href="/monitoring" style={{ color: "var(--accent)", fontWeight: 700 }}>
             Monitoring
-          </a>
+          </Link>
         </div>
       </nav>
 

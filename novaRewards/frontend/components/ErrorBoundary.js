@@ -88,6 +88,8 @@ export default class ErrorBoundary extends React.Component {
                 Try Again
               </button>
               
+              {/* Full reload on purpose: the app tree just crashed, so client-side routing is not trusted. */}
+              {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
               <a
                 href="/"
                 className="px-6 py-2 bg-gray-200 hover:bg-gray-300 dark:bg-gray-700 dark:hover:bg-gray-600 text-gray-900 dark:text-white rounded-md transition-colors"

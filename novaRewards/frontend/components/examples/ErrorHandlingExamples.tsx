@@ -300,7 +300,7 @@ export function ErrorHandlingExamples() {
             • The error will be caught and displayed in an error modal
           </li>
           <li>
-            • For retryable errors, you can click "Try Again" to retry
+            • For retryable errors, you can click &quot;Try Again&quot; to retry
           </li>
           <li>
             • Error details are logged to Sentry for monitoring

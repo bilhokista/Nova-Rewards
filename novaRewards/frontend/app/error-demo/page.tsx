@@ -32,7 +32,7 @@ export default function ErrorDemoPage() {
           </h1>
           <p className="text-lg text-gray-600 dark:text-gray-400 max-w-2xl mx-auto">
             Explore all error handling features in Nova-Rewards. This page
-            demonstrates different error scenarios, how they're displayed, and
+            demonstrates different error scenarios, how they&apos;re displayed, and
             how to recover from them.
           </p>
           <div className="inline-block px-4 py-2 bg-yellow-100 dark:bg-yellow-900/30 border border-yellow-300 dark:border-yellow-700 rounded-lg text-sm text-yellow-800 dark:text-yellow-200">
