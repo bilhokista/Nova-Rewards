@@ -45,11 +45,42 @@ pub struct StakeRecord {
     pub last_claimed_at: u64,
 }
 
+/// Optional stake held inside an [`AccountSnapshot`].
+///
+/// `#[contracttype]` structs cannot hold `Option<UserType>` fields when the
+/// SDK's `testutils` feature is on (no `ScVal: From<StakeRecord>` exists for the
+/// generated XDR conversion), which broke `cargo test` for the whole workspace.
+/// A contract enum encodes the same "maybe a stake" state and converts cleanly.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SnapshotStake {
+    None,
+    Some(StakeRecord),
+}
+
+impl SnapshotStake {
+    pub fn into_option(self) -> Option<StakeRecord> {
+        match self {
+            SnapshotStake::None => None,
+            SnapshotStake::Some(stake) => Some(stake),
+        }
+    }
+}
+
+impl From<Option<StakeRecord>> for SnapshotStake {
+    fn from(stake: Option<StakeRecord>) -> Self {
+        match stake {
+            Some(stake) => SnapshotStake::Some(stake),
+            None => SnapshotStake::None,
+        }
+    }
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AccountSnapshot {
     pub balance: i128,
-    pub stake: Option<StakeRecord>,
+    pub stake: SnapshotStake,
     pub captured_at: u64,
 }
 
@@ -1087,7 +1118,7 @@ impl NovaRewardsContract {
 
         let snapshot = AccountSnapshot {
             balance: Self::read_balance(&env, &user),
-            stake: Self::read_stake(&env, &user),
+            stake: Self::read_stake(&env, &user).into(),
             captured_at: env.ledger().timestamp(),
         };
 
@@ -1133,7 +1164,7 @@ impl NovaRewardsContract {
             .expect("snapshot not found");
 
         Self::write_balance(&env, &user, snapshot.balance);
-        if let Some(stake) = snapshot.stake.clone() {
+        if let Some(stake) = snapshot.stake.clone().into_option() {
             Self::write_stake(&env, &user, &stake);
         } else {
             Self::clear_stake(&env, &user);
