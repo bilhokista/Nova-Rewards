@@ -39,6 +39,7 @@
 //! | 28   | `VotingPeriodNotEnded`   | Finalise was called before the voting period ended.          |
 //! | 29   | `ProposalNotPassed`      | Execute was called on a proposal that did not pass.          |
 //! | 30   | `Overflow`               | Arithmetic overflow detected in a checked operation.         |
+//! | 31   | `InvalidThreshold`       | Multisig threshold is zero or exceeds the signer count.      |
 
 #![no_std]
 
@@ -132,4 +133,8 @@ pub enum ContractError {
     // ── Arithmetic ────────────────────────────────────────────────────────────
     /// Arithmetic overflow detected in a checked operation (code 30).
     Overflow = 30,
+
+    // ── Multisig ──────────────────────────────────────────────────────────────
+    /// Multisig threshold is zero or exceeds the signer count (code 31).
+    InvalidThreshold = 31,
 }

@@ -1,46 +1,65 @@
 //! # Campaign Contract
 //!
-//! Multi-token reward campaigns with participant management and M-of-N upgrade support.
+//! Allows merchants to create, update, pause, and terminate reward campaigns
+//! on-chain. Each campaign defines the reward token, amount per action,
+//! eligibility criteria, and expiry ledger. This contract is the primary
+//! interface between merchant business logic and the reward distribution system.
 //!
-//! ## Event Schema (v1)
-//! All events include `schema_version` as the first data element.
+//! ## Lifecycle
+//! 1. Admin calls [`initialize`](CampaignContract::initialize).
+//! 2. Merchant calls [`create_campaign`](CampaignContract::create_campaign).
+//! 3. Merchant calls [`pause_campaign`](CampaignContract::pause_campaign) /
+//!    [`resume_campaign`](CampaignContract::resume_campaign) as needed.
+//! 4. Merchant or admin calls [`end_campaign`](CampaignContract::end_campaign)
+//!    to permanently close the campaign.
+//! 5. Distribution contract calls [`deduct_budget`](CampaignContract::deduct_budget)
+//!    when issuing a reward; fails gracefully when budget is exhausted.
 //!
-//! | topics                          | data                                                    |
-//! |---------------------------------|---------------------------------------------------------|
-//! | `("camp", "created")`           | `(v, id, owner, reward_count, max_participants)`        |
-//! | `("camp", "activated")`         | `(v, id, owner)`                                        |
-//! | `("camp", "deactivated")`       | `(v, id, owner)`                                        |
-//! | `("camp", "joined")`            | `(v, id, participant)`                                  |
-//! | `("camp", "reward_issued")`     | `(v, id, participant, reward_count)`                    |
-//! | `("camp", "paused")`            | `(v, admin)`                                            |
-//! | `("camp", "unpaused")`          | `(v, admin)`                                            |
-//! | `("camp", "upgraded")`          | `(v, new_wasm_hash)`                                    |
+//! Contract WASM upgrades go through an M-of-N signer approval
+//! ([`approve_upgrade`](CampaignContract::approve_upgrade)); the signer set and
+//! threshold are fixed at initialization.
+//!
+//! ## Events
+//! - `("campaign", "created")` — campaign created
+//! - `("campaign", "paused")`  — campaign paused
+//! - `("campaign", "resumed")` — campaign resumed
+//! - `("campaign", "ended")`   — campaign permanently ended
+//! - `("camp", "upgraded")`    — contract WASM upgraded (M-of-N approved)
+//!
+//! ## Error Handling
+//! All campaign functions return `Result<T, ContractError>`. The upgrade
+//! path keeps the string panics (`"not an authorized signer"`,
+//! `"already approved"`) shared by every contract's upgrade tests.
 #![no_std]
+
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Vec,
 };
+use errors::ContractError;
 
-// ── Constants ────────────────────────────────────────────────────────────────
-const MAX_TOKENS: u32 = 5;
+// ── Storage TTL (ledgers) ─────────────────────────────────────────────────────
 
-/// Schema version for all events emitted by this contract.
-pub const EVENT_SCHEMA_VERSION: u32 = 1;
+/// Persistent storage TTL: ~31 days at 5 s/ledger (535 680 ledgers).
+const PERSISTENT_TTL: u32 = 535_680;
 
-// ── Storage Keys ─────────────────────────────────────────────────────────────
+// ── Storage keys ──────────────────────────────────────────────────────────────
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     /// Instance: admin address.
     Admin,
-    Campaign(u64),
-    Participants(u64),
-    Joined(u64, Address),
+    /// Instance: contract-level pause flag.
     Paused,
-    /// Multisig signers for upgrade authorization
+    /// Instance: monotonically increasing campaign id counter.
+    CampaignCount,
+    /// Persistent: campaign data keyed by id.
+    Campaign(u64),
+    /// Instance: multisig signers for upgrade authorization.
     Signers,
-    /// Minimum approvals required for upgrade
+    /// Instance: minimum approvals required for upgrade.
     Threshold,
-    /// Pending upgrade approvals: wasm_hash -> Vec<Address>
+    /// Instance: pending upgrade approvals keyed by WASM hash.
     UpgradeApprovals(BytesN<32>),
 }
 
@@ -82,70 +101,6 @@ pub struct Campaign {
     pub status: CampaignStatus,
 }
 
-// ── Event helpers ─────────────────────────────────────────────────────────────
-
-fn emit_campaign_created(
-    env: &Env,
-    id: u64,
-    owner: &Address,
-    reward_count: u32,
-    max_participants: u32,
-) {
-    env.events().publish(
-        (symbol_short!("camp"), symbol_short!("created")),
-        (EVENT_SCHEMA_VERSION, id, owner.clone(), reward_count, max_participants),
-    );
-}
-
-fn emit_campaign_activated(env: &Env, id: u64, owner: &Address) {
-    env.events().publish(
-        (symbol_short!("camp"), symbol_short!("activated")),
-        (EVENT_SCHEMA_VERSION, id, owner.clone()),
-    );
-}
-
-fn emit_campaign_deactivated(env: &Env, id: u64, owner: &Address) {
-    env.events().publish(
-        (symbol_short!("camp"), symbol_short!("deactivated")),
-        (EVENT_SCHEMA_VERSION, id, owner.clone()),
-    );
-}
-
-fn emit_campaign_joined(env: &Env, id: u64, participant: &Address) {
-    env.events().publish(
-        (symbol_short!("camp"), symbol_short!("joined")),
-        (EVENT_SCHEMA_VERSION, id, participant.clone()),
-    );
-}
-
-fn emit_reward_issued(env: &Env, id: u64, participant: &Address, reward_count: u32) {
-    env.events().publish(
-        (symbol_short!("camp"), symbol_short!("rwd_issued")),
-        (EVENT_SCHEMA_VERSION, id, participant.clone(), reward_count),
-    );
-}
-
-fn emit_paused(env: &Env, admin: &Address) {
-    env.events().publish(
-        (symbol_short!("camp"), symbol_short!("paused")),
-        (EVENT_SCHEMA_VERSION, admin.clone()),
-    );
-}
-
-fn emit_unpaused(env: &Env, admin: &Address) {
-    env.events().publish(
-        (symbol_short!("camp"), symbol_short!("unpaused")),
-        (EVENT_SCHEMA_VERSION, admin.clone()),
-    );
-}
-
-fn emit_contract_upgraded(env: &Env, new_wasm_hash: &BytesN<32>) {
-    env.events().publish(
-        (symbol_short!("camp"), symbol_short!("upgraded")),
-        (EVENT_SCHEMA_VERSION, new_wasm_hash.clone()),
-    );
-}
-
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -155,29 +110,30 @@ pub struct CampaignContract;
 impl CampaignContract {
     // ── Initialization ────────────────────────────────────────────────────────
 
-    /// One-time contract setup. Sets the admin and initializes the campaign counter.
+    /// One-time contract setup. Sets the admin, the upgrade signer set and
+    /// threshold, and initializes the campaign counter.
     ///
     /// # Errors
     /// - [`ContractError::AlreadyInitialized`] if called more than once.
-    pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
-    /// Initialize the contract with an admin and upgrade multisig config.
-    ///
-    /// # Parameters
-    /// - `admin` – Admin address for pause/unpause operations.
-    /// - `signers` – Multisig signer set for upgrade authorization.
-    /// - `threshold` – Minimum approvals required to execute an upgrade.
-    pub fn initialize(env: Env, admin: Address, signers: Vec<Address>, threshold: u32) {
+    /// - [`ContractError::InvalidThreshold`] if `threshold` is 0 or exceeds the signer count.
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), ContractError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(ContractError::AlreadyInitialized);
         }
-        assert!(threshold >= 1, "threshold must be at least 1");
-        assert!(
-            signers.len() >= threshold,
-            "signers count must be >= threshold"
-        );
+        if threshold == 0 || signers.len() < threshold {
+            return Err(ContractError::InvalidThreshold);
+        }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Signers, &signers);
         env.storage().instance().set(&DataKey::Threshold, &threshold);
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage().instance().set(&DataKey::CampaignCount, &0_u64);
+        Ok(())
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -202,13 +158,6 @@ impl CampaignContract {
     fn require_not_paused(env: &Env) -> Result<(), ContractError> {
         if Self::contract_is_paused(env) {
             return Err(ContractError::ContractPaused);
-    fn is_paused_internal(env: &Env) -> bool {
-        env.storage().instance().get(&DataKey::Paused).unwrap_or(false)
-    }
-
-    fn require_not_paused(env: &Env) {
-        if Self::is_paused_internal(env) {
-            panic!("contract is paused");
         }
         Ok(())
     }
@@ -267,10 +216,6 @@ impl CampaignContract {
     /// - [`ContractError::InvalidRewardAmount`] — `reward_per_action <= 0`.
     /// - [`ContractError::InvalidBudget`]       — `max_budget <= 0`.
     /// - [`ContractError::InvalidLedgerRange`]  — `start_ledger >= end_ledger`.
-    /// Create a new campaign with multiple token rewards (up to 5).
-    ///
-    /// # Events
-    /// Emits `("camp", "created")` with `(schema_version, id, owner, reward_count, max_participants)`.
     pub fn create_campaign(
         env: Env,
         owner: Address,
@@ -285,8 +230,6 @@ impl CampaignContract {
 
         if reward_per_action <= 0 {
             return Err(ContractError::InvalidRewardAmount);
-        if rewards.len() > MAX_TOKENS {
-            panic!("too many tokens");
         }
         if max_budget <= 0 {
             return Err(ContractError::InvalidBudget);
@@ -313,21 +256,6 @@ impl CampaignContract {
             max_budget,
             spent_budget: 0,
             status: CampaignStatus::Active,
-
-        for reward in rewards.iter() {
-            if reward.amount <= 0 {
-                panic!("reward amount must be positive");
-            }
-        }
-
-        let reward_count = rewards.len() as u32;
-        let data = CampaignData {
-            owner: owner.clone(),
-            rewards,
-            active: false,
-            completed: false,
-            max_participants,
-            current_participants: 0,
         };
 
         Self::save_campaign(&env, id, &campaign);
@@ -389,39 +317,6 @@ impl CampaignContract {
 
         Ok(())
     }
-        emit_campaign_created(&env, id, &owner, reward_count, max_participants);
-    }
-
-    /// Activate or deactivate a campaign. Only owner can call.
-    ///
-    /// # Events
-    /// Emits `("camp", "activated")` or `("camp", "deactivated")`.
-    pub fn set_active(env: Env, id: u64, active: bool) {
-        Self::require_not_paused(&env);
-        let key = DataKey::Campaign(id);
-        let mut data: CampaignData = env.storage().persistent().get(&key).expect("campaign not found");
-        data.owner.require_auth();
-
-        data.active = active;
-        env.storage().persistent().set(&key, &data);
-        env.storage().persistent().extend_ttl(&key, 2_678_400, 2_678_400);
-
-        if active {
-            emit_campaign_activated(&env, id, &data.owner);
-        } else {
-            emit_campaign_deactivated(&env, id, &data.owner);
-        }
-    }
-
-    /// Join an active campaign.
-    ///
-    /// # Events
-    /// Emits `("camp", "joined")` with `(schema_version, id, participant)`.
-    pub fn join_campaign(env: Env, id: u64, participant: Address) {
-        Self::require_not_paused(&env);
-        participant.require_auth();
-        let key = DataKey::Campaign(id);
-        let mut data: CampaignData = env.storage().persistent().get(&key).expect("campaign not found");
 
     /// Resume a paused campaign, re-enabling reward distributions.
     ///
@@ -496,38 +391,6 @@ impl CampaignContract {
 
         if !Self::is_owner_or_admin(&env, &caller, &campaign)? {
             return Err(ContractError::Unauthorized);
-        data.current_participants += 1;
-        env.storage().persistent().set(&key, &data);
-        env.storage().persistent().extend_ttl(&key, 2_678_400, 2_678_400);
-        env.storage().persistent().set(&joined_key, &true);
-
-        let mut participants: Vec<Address> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::Participants(id))
-            .unwrap();
-        participants.push_back(participant.clone());
-        env.storage().persistent().set(&DataKey::Participants(id), &participants);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::Participants(id), 2_678_400, 2_678_400);
-
-        emit_campaign_joined(&env, id, &participant);
-    }
-
-    /// Distribute all configured rewards to a participant atomically.
-    ///
-    /// # Events
-    /// Emits `("camp", "rwd_issued")` with `(schema_version, id, participant, reward_count)`.
-    pub fn distribute_reward(env: Env, id: u64, participant: Address) {
-        Self::require_not_paused(&env);
-        let key = DataKey::Campaign(id);
-        let data: CampaignData = env.storage().persistent().get(&key).expect("campaign not found");
-        data.owner.require_auth();
-
-        let joined_key = DataKey::Joined(id, participant.clone());
-        if !env.storage().persistent().has(&joined_key) {
-            panic!("participant not in campaign");
         }
         if campaign.status == CampaignStatus::Ended {
             return Err(ContractError::CampaignAlreadyEnded);
@@ -676,41 +539,6 @@ impl CampaignContract {
     /// Returns `true` if the contract-level pause is active.
     pub fn is_contract_paused(env: Env) -> bool {
         Self::contract_is_paused(&env)
-        let reward_count = data.rewards.len() as u32;
-        emit_reward_issued(&env, id, &participant, reward_count);
-    }
-
-    pub fn get_campaign(env: Env, id: u64) -> CampaignData {
-        let key = DataKey::Campaign(id);
-        let data = env.storage().persistent().get(&key).expect("campaign not found");
-        env.storage().persistent().extend_ttl(&key, 2_678_400, 2_678_400);
-        data
-    }
-
-    /// Pauses all contract operations. Only admin can call.
-    ///
-    /// # Events
-    /// Emits `("camp", "paused")` with `(schema_version, admin)`.
-    pub fn pause(env: Env) {
-        let admin = Self::get_admin(&env);
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Paused, &true);
-        emit_paused(&env, &admin);
-    }
-
-    /// Unpauses contract operations. Only admin can call.
-    ///
-    /// # Events
-    /// Emits `("camp", "unpaused")` with `(schema_version, admin)`.
-    pub fn unpause(env: Env) {
-        let admin = Self::get_admin(&env);
-        admin.require_auth();
-        env.storage().instance().set(&DataKey::Paused, &false);
-        emit_unpaused(&env, &admin);
-    }
-
-    pub fn is_paused(env: Env) -> bool {
-        Self::is_paused_internal(&env)
     }
 
     // ── Upgrade (M-of-N multisig) ─────────────────────────────────────────────
@@ -718,7 +546,7 @@ impl CampaignContract {
     /// Approve a pending WASM upgrade. Executes when threshold is reached.
     ///
     /// # Events
-    /// Emits `("camp", "upgraded")` with `(schema_version, new_wasm_hash)` when threshold is met.
+    /// Emits `("camp", "upgraded")` with `new_wasm_hash` when threshold is met.
     ///
     /// # Panics
     /// - `"not an authorized signer"` if `signer` is not in the signer set.
@@ -731,8 +559,7 @@ impl CampaignContract {
             .instance()
             .get(&DataKey::Signers)
             .expect("not initialized");
-        let is_authorized = signers.iter().any(|s| s == signer);
-        assert!(is_authorized, "not an authorized signer");
+        assert!(signers.contains(&signer), "not an authorized signer");
 
         let approval_key = DataKey::UpgradeApprovals(new_wasm_hash.clone());
         let mut approvals: Vec<Address> = env
@@ -740,34 +567,26 @@ impl CampaignContract {
             .instance()
             .get(&approval_key)
             .unwrap_or(Vec::new(&env));
-
-        let already_approved = approvals.iter().any(|a| a == signer);
-        assert!(!already_approved, "already approved");
+        assert!(!approvals.contains(&signer), "already approved");
 
         approvals.push_back(signer);
-        env.storage().instance().set(&approval_key, &approvals);
-
-        let threshold: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Threshold)
-            .unwrap_or(1);
-
-        if approvals.len() >= threshold {
+        if approvals.len() >= Self::get_threshold(env.clone()) {
             env.storage().instance().remove(&approval_key);
-            emit_contract_upgraded(&env, &new_wasm_hash);
+            env.events().publish(
+                (symbol_short!("camp"), symbol_short!("upgraded")),
+                new_wasm_hash.clone(),
+            );
             env.deployer().update_current_contract_wasm(new_wasm_hash);
+        } else {
+            env.storage().instance().set(&approval_key, &approvals);
         }
     }
 
     pub fn get_upgrade_approvals(env: Env, new_wasm_hash: BytesN<32>) -> u32 {
-        let approval_key = DataKey::UpgradeApprovals(new_wasm_hash);
-        let approvals: Vec<Address> = env
-            .storage()
+        env.storage()
             .instance()
-            .get(&approval_key)
-            .unwrap_or(Vec::new(&env));
-        approvals.len()
+            .get::<_, Vec<Address>>(&DataKey::UpgradeApprovals(new_wasm_hash))
+            .map_or(0, |approvals| approvals.len())
     }
 
     pub fn get_threshold(env: Env) -> u32 {
@@ -791,8 +610,10 @@ impl CampaignContract {
 mod tests {
     use super::*;
     use errors::ContractError;
-    use soroban_sdk::{testutils::{Address as _, Ledger}, Env};
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{
+        testutils::{Address as _, Events as _, Ledger},
+        vec, BytesN, Env,
+    };
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -800,9 +621,11 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         let contract_id = env.register(CampaignContract, ());
-        let client = CampaignContractClient::new(env, &contract_id);
-        client.initialize(&admin, &soroban_sdk::vec![env, admin.clone()], &1);
-        (admin, client)
+        let client = CampaignContractClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let token = Address::generate(&env);
+        client.initialize(&admin, &vec![&env, admin.clone()], &1);
+        (env, admin, token, client)
     }
 
     /// Creates a default campaign starting at ledger 1, ending at ledger 1000.
@@ -813,8 +636,7 @@ mod tests {
     ) -> (u64, Address) {
         let owner = Address::generate(env);
         let id = client
-            .create_campaign(&owner, token, &100, &1, &1000, &10_000)
-            .unwrap();
+            .create_campaign(&owner, token, &100, &1, &1000, &10_000);
         (id, owner)
     }
 
@@ -827,53 +649,29 @@ mod tests {
         let contract_id = env.register(CampaignContract, ());
         let client = CampaignContractClient::new(&env, &contract_id);
         let admin = Address::generate(&env);
-        assert_eq!(client.initialize(&admin), Ok(()));
+        client.initialize(&admin, &vec![&env, admin.clone()], &1);
+        assert_eq!(client.campaign_count(), 0);
     }
 
     #[test]
     fn test_initialize_twice_returns_already_initialized() {
-        let (_, admin, _, client) = setup();
-        let result = client.initialize(&admin);
-        assert_eq!(result, Err(ContractError::AlreadyInitialized));
+        let (env, admin, _, client) = setup();
+        let result = client.try_initialize(&admin, &vec![&env, admin.clone()], &1);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::AlreadyInitialized);
     }
 
     // ── create_campaign ───────────────────────────────────────────────────────
-        let (_admin, client) = setup(&env);
-        let owner = Address::generate(&env);
-        let token1 = Address::generate(&env);
-        let token2 = Address::generate(&env);
-        let id = 1u64;
-
-        let rewards = soroban_sdk::vec![
-            &env,
-            TokenReward { token: token1.clone(), amount: 100 },
-            TokenReward { token: token2.clone(), amount: 50 },
-        ];
-        client.create_campaign(&id, &owner, &rewards, &2);
-        let data = client.get_campaign(&id);
-        assert_eq!(data.owner, owner);
-        assert_eq!(data.active, false);
-        assert_eq!(data.rewards.len(), 2);
-
-        client.set_active(&id, &true);
-        assert_eq!(client.get_campaign(&id).active, true);
-
-        let alice = Address::generate(&env);
-        let bob = Address::generate(&env);
-        client.join_campaign(&id, &alice);
-        client.join_campaign(&id, &bob);
 
     #[test]
     fn test_create_campaign_ok() {
         let (env, _admin, token, client) = setup();
         let owner = Address::generate(&env);
         let id = client
-            .create_campaign(&owner, &token, &50, &1, &500, &5_000)
-            .unwrap();
+            .create_campaign(&owner, &token, &50, &1, &500, &5_000);
         assert_eq!(id, 1);
         assert_eq!(client.campaign_count(), 1);
 
-        let c = client.get_campaign(&id).unwrap();
+        let c = client.get_campaign(&id);
         assert_eq!(c.owner, owner);
         assert_eq!(c.token, token);
         assert_eq!(c.reward_per_action, 50);
@@ -888,105 +686,59 @@ mod tests {
     fn test_create_campaign_ids_increment() {
         let (env, _admin, token, client) = setup();
         let owner = Address::generate(&env);
-        let id1 = client.create_campaign(&owner, &token, &10, &1, &100, &1_000).unwrap();
-        let id2 = client.create_campaign(&owner, &token, &10, &1, &100, &1_000).unwrap();
+        let id1 = client.create_campaign(&owner, &token, &10, &1, &100, &1_000);
+        let id2 = client.create_campaign(&owner, &token, &10, &1, &100, &1_000);
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);
-        client.distribute_reward(&id, &alice);
     }
 
     #[test]
     fn test_create_campaign_invalid_reward_amount() {
         let (env, _admin, token, client) = setup();
         let owner = Address::generate(&env);
-        let result = client.create_campaign(&owner, &token, &0, &1, &100, &1_000);
-        assert_eq!(result, Err(ContractError::InvalidRewardAmount));
+        let result = client.try_create_campaign(&owner, &token, &0, &1, &100, &1_000);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::InvalidRewardAmount);
     }
 
     #[test]
     fn test_create_campaign_negative_reward_amount() {
         let (env, _admin, token, client) = setup();
         let owner = Address::generate(&env);
-        let result = client.create_campaign(&owner, &token, &-1, &1, &100, &1_000);
-        assert_eq!(result, Err(ContractError::InvalidRewardAmount));
+        let result = client.try_create_campaign(&owner, &token, &-1, &1, &100, &1_000);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::InvalidRewardAmount);
     }
 
     #[test]
     fn test_create_campaign_invalid_budget() {
         let (env, _admin, token, client) = setup();
-        let tokens: Vec<Address> = (0..5).map(|_| Address::generate(&env)).collect();
-        let id = 1u64;
-
-        let rewards = soroban_sdk::vec![
-            &env,
-            TokenReward { token: tokens[0].clone(), amount: 100 },
-            TokenReward { token: tokens[1].clone(), amount: 200 },
-            TokenReward { token: tokens[2].clone(), amount: 300 },
-            TokenReward { token: tokens[3].clone(), amount: 400 },
-            TokenReward { token: tokens[4].clone(), amount: 500 },
-        ];
-        client.create_campaign(&id, &owner, &rewards, &1);
-        let data = client.get_campaign(&id);
-        assert_eq!(data.rewards.len(), 5);
-    }
-
-    #[test]
-    #[should_panic(expected = "too many tokens")]
-    fn test_max_tokens_exceeded() {
-        let env = Env::default();
-        let (_admin, client) = setup(&env);
         let owner = Address::generate(&env);
-        let tokens: Vec<Address> = (0..6).map(|_| Address::generate(&env)).collect();
-        let id = 1u64;
-
-        let rewards = soroban_sdk::vec![
-            &env,
-            TokenReward { token: tokens[0].clone(), amount: 100 },
-            TokenReward { token: tokens[1].clone(), amount: 100 },
-            TokenReward { token: tokens[2].clone(), amount: 100 },
-            TokenReward { token: tokens[3].clone(), amount: 100 },
-            TokenReward { token: tokens[4].clone(), amount: 100 },
-            TokenReward { token: tokens[5].clone(), amount: 100 },
-        ];
-        client.create_campaign(&id, &owner, &rewards, &1);
-    }
-
-    #[test]
-    #[should_panic(expected = "campaign is full")]
-    fn test_campaign_full() {
-        let env = Env::default();
-        let (_admin, client) = setup(&env);
-        let owner = Address::generate(&env);
-        let result = client.create_campaign(&owner, &token, &10, &1, &100, &0);
-        assert_eq!(result, Err(ContractError::InvalidBudget));
+        let result = client.try_create_campaign(&owner, &token, &10, &1, &100, &0);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::InvalidBudget);
     }
 
     #[test]
     fn test_create_campaign_invalid_ledger_range_equal() {
         let (env, _admin, token, client) = setup();
         let owner = Address::generate(&env);
-        let result = client.create_campaign(&owner, &token, &10, &100, &100, &1_000);
-        assert_eq!(result, Err(ContractError::InvalidLedgerRange));
+        let result = client.try_create_campaign(&owner, &token, &10, &100, &100, &1_000);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::InvalidLedgerRange);
     }
-        let rewards = soroban_sdk::vec![&env, TokenReward { token: token.clone(), amount: 100 }];
-        client.create_campaign(&id, &owner, &rewards, &1);
-        client.set_active(&id, &true);
 
     #[test]
     fn test_create_campaign_invalid_ledger_range_start_after_end() {
         let (env, _admin, token, client) = setup();
         let owner = Address::generate(&env);
-        let result = client.create_campaign(&owner, &token, &10, &200, &100, &1_000);
-        assert_eq!(result, Err(ContractError::InvalidLedgerRange));
+        let result = client.try_create_campaign(&owner, &token, &10, &200, &100, &1_000);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::InvalidLedgerRange);
     }
 
     #[test]
     fn test_create_campaign_while_contract_paused() {
         let (env, admin, token, client) = setup();
-        client.pause_contract(&admin).unwrap();
+        client.pause_contract(&admin);
         let owner = Address::generate(&env);
-        let result = client.create_campaign(&owner, &token, &10, &1, &100, &1_000);
-        assert_eq!(result, Err(ContractError::ContractPaused));
+        let result = client.try_create_campaign(&owner, &token, &10, &1, &100, &1_000);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::ContractPaused);
     }
 
     // ── pause_campaign ────────────────────────────────────────────────────────
@@ -995,16 +747,16 @@ mod tests {
     fn test_pause_campaign_by_owner() {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
-        client.pause_campaign(&owner, &id).unwrap();
-        assert_eq!(client.get_campaign(&id).unwrap().status, CampaignStatus::Paused);
+        client.pause_campaign(&owner, &id);
+        assert_eq!(client.get_campaign(&id).status, CampaignStatus::Paused);
     }
 
     #[test]
     fn test_pause_campaign_by_admin() {
         let (env, admin, token, client) = setup();
         let (id, _owner) = make_campaign(&env, &client, &token);
-        client.pause_campaign(&admin, &id).unwrap();
-        assert_eq!(client.get_campaign(&id).unwrap().status, CampaignStatus::Paused);
+        client.pause_campaign(&admin, &id);
+        assert_eq!(client.get_campaign(&id).status, CampaignStatus::Paused);
     }
 
     #[test]
@@ -1012,67 +764,34 @@ mod tests {
         let (env, _admin, token, client) = setup();
         let (id, _owner) = make_campaign(&env, &client, &token);
         let stranger = Address::generate(&env);
-        let result = client.pause_campaign(&stranger, &id);
-        assert_eq!(result, Err(ContractError::Unauthorized));
+        let result = client.try_pause_campaign(&stranger, &id);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::Unauthorized);
     }
 
     #[test]
     fn test_pause_campaign_not_found() {
         let (env, _admin, _token, client) = setup();
         let caller = Address::generate(&env);
-        let result = client.pause_campaign(&caller, &999);
-        assert_eq!(result, Err(ContractError::CampaignNotFound));
-        let rewards = soroban_sdk::vec![&env, TokenReward { token: token.clone(), amount: 100 }];
-        client.create_campaign(&id, &owner, &rewards, &10);
-        let alice = Address::generate(&env);
-        client.join_campaign(&id, &alice);
+        let result = client.try_pause_campaign(&caller, &999);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::CampaignNotFound);
     }
-
-    #[test]
-    fn test_pause_unpause() {
-        let env = Env::default();
-        let (_admin, client) = setup(&env);
-
-        assert_eq!(client.is_paused(), false);
-        client.pause();
-        assert_eq!(client.is_paused(), true);
-        client.unpause();
-        assert_eq!(client.is_paused(), false);
-    }
-
-    #[test]
-    #[should_panic(expected = "contract is paused")]
-    fn test_create_campaign_while_paused() {
-        let env = Env::default();
-        let (_admin, client) = setup(&env);
-        let owner = Address::generate(&env);
-        let token = Address::generate(&env);
-        let id = 1u64;
-
-        client.pause();
-
-        let rewards = soroban_sdk::vec![&env, TokenReward { token: token.clone(), amount: 100 }];
-        client.create_campaign(&id, &owner, &rewards, &10);
-    }
-
-    // ── Upgrade tests ─────────────────────────────────────────────────────────
 
     #[test]
     fn test_pause_campaign_already_paused() {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
-        client.pause_campaign(&owner, &id).unwrap();
-        let result = client.pause_campaign(&owner, &id);
-        assert_eq!(result, Err(ContractError::CampaignAlreadyPaused));
+        client.pause_campaign(&owner, &id);
+        let result = client.try_pause_campaign(&owner, &id);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::CampaignAlreadyPaused);
     }
 
     #[test]
     fn test_pause_campaign_already_ended() {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
-        client.end_campaign(&owner, &id).unwrap();
-        let result = client.pause_campaign(&owner, &id);
-        assert_eq!(result, Err(ContractError::CampaignAlreadyEnded));
+        client.end_campaign(&owner, &id);
+        let result = client.try_pause_campaign(&owner, &id);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::CampaignAlreadyEnded);
     }
 
     // ── resume_campaign ───────────────────────────────────────────────────────
@@ -1081,28 +800,28 @@ mod tests {
     fn test_resume_campaign_by_owner() {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
-        client.pause_campaign(&owner, &id).unwrap();
-        client.resume_campaign(&owner, &id).unwrap();
-        assert_eq!(client.get_campaign(&id).unwrap().status, CampaignStatus::Active);
+        client.pause_campaign(&owner, &id);
+        client.resume_campaign(&owner, &id);
+        assert_eq!(client.get_campaign(&id).status, CampaignStatus::Active);
     }
 
     #[test]
     fn test_resume_campaign_by_admin() {
         let (env, admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
-        client.pause_campaign(&owner, &id).unwrap();
-        client.resume_campaign(&admin, &id).unwrap();
-        assert_eq!(client.get_campaign(&id).unwrap().status, CampaignStatus::Active);
+        client.pause_campaign(&owner, &id);
+        client.resume_campaign(&admin, &id);
+        assert_eq!(client.get_campaign(&id).status, CampaignStatus::Active);
     }
 
     #[test]
     fn test_resume_campaign_unauthorized() {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
-        client.pause_campaign(&owner, &id).unwrap();
+        client.pause_campaign(&owner, &id);
         let stranger = Address::generate(&env);
-        let result = client.resume_campaign(&stranger, &id);
-        assert_eq!(result, Err(ContractError::Unauthorized));
+        let result = client.try_resume_campaign(&stranger, &id);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::Unauthorized);
     }
 
     #[test]
@@ -1110,28 +829,28 @@ mod tests {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
         // Campaign is Active, not Paused.
-        let result = client.resume_campaign(&owner, &id);
-        assert_eq!(result, Err(ContractError::CampaignNotPaused));
+        let result = client.try_resume_campaign(&owner, &id);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::CampaignNotPaused);
     }
 
     #[test]
     fn test_resume_campaign_already_ended() {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
-        client.end_campaign(&owner, &id).unwrap();
-        let result = client.resume_campaign(&owner, &id);
-        assert_eq!(result, Err(ContractError::CampaignAlreadyEnded));
+        client.end_campaign(&owner, &id);
+        let result = client.try_resume_campaign(&owner, &id);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::CampaignAlreadyEnded);
     }
 
     #[test]
     fn test_resume_campaign_expired() {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
-        client.pause_campaign(&owner, &id).unwrap();
+        client.pause_campaign(&owner, &id);
         // Advance ledger past end_ledger (1000).
         env.ledger().with_mut(|l| l.sequence_number = 1001);
-        let result = client.resume_campaign(&owner, &id);
-        assert_eq!(result, Err(ContractError::CampaignExpired));
+        let result = client.try_resume_campaign(&owner, &id);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::CampaignExpired);
     }
 
     // ── end_campaign ──────────────────────────────────────────────────────────
@@ -1140,25 +859,25 @@ mod tests {
     fn test_end_campaign_by_owner() {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
-        client.end_campaign(&owner, &id).unwrap();
-        assert_eq!(client.get_campaign(&id).unwrap().status, CampaignStatus::Ended);
+        client.end_campaign(&owner, &id);
+        assert_eq!(client.get_campaign(&id).status, CampaignStatus::Ended);
     }
 
     #[test]
     fn test_end_campaign_by_admin() {
         let (env, admin, token, client) = setup();
         let (id, _owner) = make_campaign(&env, &client, &token);
-        client.end_campaign(&admin, &id).unwrap();
-        assert_eq!(client.get_campaign(&id).unwrap().status, CampaignStatus::Ended);
+        client.end_campaign(&admin, &id);
+        assert_eq!(client.get_campaign(&id).status, CampaignStatus::Ended);
     }
 
     #[test]
     fn test_end_campaign_from_paused_state() {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
-        client.pause_campaign(&owner, &id).unwrap();
-        client.end_campaign(&owner, &id).unwrap();
-        assert_eq!(client.get_campaign(&id).unwrap().status, CampaignStatus::Ended);
+        client.pause_campaign(&owner, &id);
+        client.end_campaign(&owner, &id);
+        assert_eq!(client.get_campaign(&id).status, CampaignStatus::Ended);
     }
 
     #[test]
@@ -1166,25 +885,25 @@ mod tests {
         let (env, _admin, token, client) = setup();
         let (id, _owner) = make_campaign(&env, &client, &token);
         let stranger = Address::generate(&env);
-        let result = client.end_campaign(&stranger, &id);
-        assert_eq!(result, Err(ContractError::Unauthorized));
+        let result = client.try_end_campaign(&stranger, &id);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::Unauthorized);
     }
 
     #[test]
     fn test_end_campaign_not_found() {
         let (env, _admin, _token, client) = setup();
         let caller = Address::generate(&env);
-        let result = client.end_campaign(&caller, &999);
-        assert_eq!(result, Err(ContractError::CampaignNotFound));
+        let result = client.try_end_campaign(&caller, &999);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::CampaignNotFound);
     }
 
     #[test]
     fn test_end_campaign_already_ended() {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
-        client.end_campaign(&owner, &id).unwrap();
-        let result = client.end_campaign(&owner, &id);
-        assert_eq!(result, Err(ContractError::CampaignAlreadyEnded));
+        client.end_campaign(&owner, &id);
+        let result = client.try_end_campaign(&owner, &id);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::CampaignAlreadyEnded);
     }
 
     // ── deduct_budget ─────────────────────────────────────────────────────────
@@ -1194,9 +913,9 @@ mod tests {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
         // Budget: 10_000, deduct 100 → remaining 9_900.
-        let remaining = client.deduct_budget(&owner, &id, &100).unwrap();
+        let remaining = client.deduct_budget(&owner, &id, &100);
         assert_eq!(remaining, 9_900);
-        assert_eq!(client.get_campaign(&id).unwrap().spent_budget, 100);
+        assert_eq!(client.get_campaign(&id).spent_budget, 100);
     }
 
     #[test]
@@ -1204,29 +923,29 @@ mod tests {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
         // Drain the full budget.
-        client.deduct_budget(&owner, &id, &10_000).unwrap();
+        client.deduct_budget(&owner, &id, &10_000);
         // Next deduction should fail.
-        let result = client.deduct_budget(&owner, &id, &1);
-        assert_eq!(result, Err(ContractError::InsufficientBudget));
+        let result = client.try_deduct_budget(&owner, &id, &1);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::InsufficientBudget);
     }
 
     #[test]
     fn test_deduct_budget_partial_exhaustion() {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
-        client.deduct_budget(&owner, &id, &9_999).unwrap();
+        client.deduct_budget(&owner, &id, &9_999);
         // Only 1 token left; requesting 2 should fail.
-        let result = client.deduct_budget(&owner, &id, &2);
-        assert_eq!(result, Err(ContractError::InsufficientBudget));
+        let result = client.try_deduct_budget(&owner, &id, &2);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::InsufficientBudget);
     }
 
     #[test]
     fn test_deduct_budget_campaign_not_active() {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
-        client.pause_campaign(&owner, &id).unwrap();
-        let result = client.deduct_budget(&owner, &id, &100);
-        assert_eq!(result, Err(ContractError::CampaignNotActive));
+        client.pause_campaign(&owner, &id);
+        let result = client.try_deduct_budget(&owner, &id, &100);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::CampaignNotActive);
     }
 
     #[test]
@@ -1234,16 +953,16 @@ mod tests {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
         env.ledger().with_mut(|l| l.sequence_number = 1001);
-        let result = client.deduct_budget(&owner, &id, &100);
-        assert_eq!(result, Err(ContractError::CampaignExpired));
+        let result = client.try_deduct_budget(&owner, &id, &100);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::CampaignExpired);
     }
 
     #[test]
     fn test_deduct_budget_zero_amount() {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
-        let result = client.deduct_budget(&owner, &id, &0);
-        assert_eq!(result, Err(ContractError::AmountMustBePositive));
+        let result = client.try_deduct_budget(&owner, &id, &0);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::AmountMustBePositive);
     }
 
     #[test]
@@ -1251,8 +970,8 @@ mod tests {
         let (env, _admin, token, client) = setup();
         let (id, _owner) = make_campaign(&env, &client, &token);
         let stranger = Address::generate(&env);
-        let result = client.deduct_budget(&stranger, &id, &100);
-        assert_eq!(result, Err(ContractError::Unauthorized));
+        let result = client.try_deduct_budget(&stranger, &id, &100);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::Unauthorized);
     }
 
     // ── remaining_budget ──────────────────────────────────────────────────────
@@ -1261,16 +980,16 @@ mod tests {
     fn test_remaining_budget() {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
-        assert_eq!(client.remaining_budget(&id).unwrap(), 10_000);
-        client.deduct_budget(&owner, &id, &3_000).unwrap();
-        assert_eq!(client.remaining_budget(&id).unwrap(), 7_000);
+        assert_eq!(client.remaining_budget(&id), 10_000);
+        client.deduct_budget(&owner, &id, &3_000);
+        assert_eq!(client.remaining_budget(&id), 7_000);
     }
 
     #[test]
     fn test_remaining_budget_not_found() {
         let (_env, _admin, _token, client) = setup();
-        let result = client.remaining_budget(&999);
-        assert_eq!(result, Err(ContractError::CampaignNotFound));
+        let result = client.try_remaining_budget(&999);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::CampaignNotFound);
     }
 
     // ── contract-level pause ──────────────────────────────────────────────────
@@ -1279,9 +998,9 @@ mod tests {
     fn test_contract_pause_unpause() {
         let (_env, admin, _token, client) = setup();
         assert!(!client.is_contract_paused());
-        client.pause_contract(&admin).unwrap();
+        client.pause_contract(&admin);
         assert!(client.is_contract_paused());
-        client.unpause_contract(&admin).unwrap();
+        client.unpause_contract(&admin);
         assert!(!client.is_contract_paused());
     }
 
@@ -1289,8 +1008,8 @@ mod tests {
     fn test_contract_pause_unauthorized() {
         let (env, _admin, _token, client) = setup();
         let stranger = Address::generate(&env);
-        let result = client.pause_contract(&stranger);
-        assert_eq!(result, Err(ContractError::Unauthorized));
+        let result = client.try_pause_contract(&stranger);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::Unauthorized);
     }
 
     // ── events ────────────────────────────────────────────────────────────────
@@ -1299,33 +1018,33 @@ mod tests {
     fn test_create_campaign_emits_event() {
         let (env, _admin, token, client) = setup();
         let owner = Address::generate(&env);
-        client.create_campaign(&owner, &token, &10, &1, &100, &1_000).unwrap();
-        assert!(!env.events().all().is_empty());
+        client.create_campaign(&owner, &token, &10, &1, &100, &1_000);
+        assert!(!env.events().all().events().is_empty());
     }
 
     #[test]
     fn test_pause_campaign_emits_event() {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
-        client.pause_campaign(&owner, &id).unwrap();
-        assert!(!env.events().all().is_empty());
+        client.pause_campaign(&owner, &id);
+        assert!(!env.events().all().events().is_empty());
     }
 
     #[test]
     fn test_resume_campaign_emits_event() {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
-        client.pause_campaign(&owner, &id).unwrap();
-        client.resume_campaign(&owner, &id).unwrap();
-        assert!(!env.events().all().is_empty());
+        client.pause_campaign(&owner, &id);
+        client.resume_campaign(&owner, &id);
+        assert!(!env.events().all().events().is_empty());
     }
 
     #[test]
     fn test_end_campaign_emits_event() {
         let (env, _admin, token, client) = setup();
         let (id, owner) = make_campaign(&env, &client, &token);
-        client.end_campaign(&owner, &id).unwrap();
-        assert!(!env.events().all().is_empty());
+        client.end_campaign(&owner, &id);
+        assert!(!env.events().all().events().is_empty());
     }
 
     // ── full lifecycle ────────────────────────────────────────────────────────
@@ -1337,51 +1056,78 @@ mod tests {
 
         // 1. Create
         let id = client
-            .create_campaign(&owner, &token, &100, &1, &1000, &10_000)
-            .unwrap();
-        assert_eq!(client.get_campaign(&id).unwrap().status, CampaignStatus::Active);
+            .create_campaign(&owner, &token, &100, &1, &1000, &10_000);
+        assert_eq!(client.get_campaign(&id).status, CampaignStatus::Active);
 
         // 2. Distribute some rewards
-        client.deduct_budget(&owner, &id, &500).unwrap();
-        assert_eq!(client.remaining_budget(&id).unwrap(), 9_500);
+        client.deduct_budget(&owner, &id, &500);
+        assert_eq!(client.remaining_budget(&id), 9_500);
 
         // 3. Pause
-        client.pause_campaign(&owner, &id).unwrap();
-        assert_eq!(client.get_campaign(&id).unwrap().status, CampaignStatus::Paused);
+        client.pause_campaign(&owner, &id);
+        assert_eq!(client.get_campaign(&id).status, CampaignStatus::Paused);
 
         // 4. Resume
-        client.resume_campaign(&admin, &id).unwrap();
-        assert_eq!(client.get_campaign(&id).unwrap().status, CampaignStatus::Active);
+        client.resume_campaign(&admin, &id);
+        assert_eq!(client.get_campaign(&id).status, CampaignStatus::Active);
 
         // 5. End
-        client.end_campaign(&owner, &id).unwrap();
-        assert_eq!(client.get_campaign(&id).unwrap().status, CampaignStatus::Ended);
+        client.end_campaign(&owner, &id);
+        assert_eq!(client.get_campaign(&id).status, CampaignStatus::Ended);
 
         // 6. No further distributions allowed
-        let result = client.deduct_budget(&owner, &id, &100);
-        assert_eq!(result, Err(ContractError::CampaignNotActive));
-    fn test_upgrade_approval_accumulates() {
+        let result = client.try_deduct_budget(&owner, &id, &100);
+        assert_eq!(result.unwrap_err().unwrap(), ContractError::CampaignNotActive);
+    }
+
+    // ── initialize: multisig config ───────────────────────────────────────────
+
+    #[test]
+    fn test_initialize_threshold_above_signers_rejected() {
+        let env = Env::default();
+        let client = CampaignContractClient::new(&env, &env.register(CampaignContract, ()));
+        let admin = Address::generate(&env);
+        let err = client
+            .try_initialize(&admin, &vec![&env, admin.clone()], &2)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, ContractError::InvalidThreshold);
+    }
+
+    // ── upgrade ───────────────────────────────────────────────────────────────
+
+    fn setup_two_signers() -> (Env, Address, CampaignContractClient<'static>) {
         let env = Env::default();
         env.mock_all_auths();
-        let cid = env.register(CampaignContract, ());
-        let client = CampaignContractClient::new(&env, &cid);
+        let client = CampaignContractClient::new(&env, &env.register(CampaignContract, ()));
         let s1 = Address::generate(&env);
         let s2 = Address::generate(&env);
-        client.initialize(&s1, &soroban_sdk::vec![&env, s1.clone(), s2.clone()], &2);
+        client.initialize(&s1, &vec![&env, s1.clone(), s2.clone()], &2);
+        (env, s1, client)
+    }
 
-        let fake_hash = BytesN::from_array(&env, &[0u8; 32]);
-        client.approve_upgrade(&s1, &fake_hash);
-        assert_eq!(client.get_upgrade_approvals(&fake_hash), 1);
-        assert_eq!(client.get_threshold(), 2);
+    #[test]
+    fn test_upgrade_approval_accumulates() {
+        let (env, s1, client) = setup_two_signers();
+        let hash = BytesN::from_array(&env, &[0u8; 32]);
+        client.approve_upgrade(&s1, &hash);
+        assert_eq!(client.get_upgrade_approvals(&hash), 1);
     }
 
     #[test]
     #[should_panic(expected = "not an authorized signer")]
     fn test_unauthorized_upgrade_rejected() {
-        let env = Env::default();
-        let (_admin, client) = setup(&env);
-        let outsider = Address::generate(&env);
-        let fake_hash = BytesN::from_array(&env, &[1u8; 32]);
-        client.approve_upgrade(&outsider, &fake_hash);
+        let (env, _s1, client) = setup_two_signers();
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        client.approve_upgrade(&Address::generate(&env), &hash);
+    }
+
+    #[test]
+    #[should_panic(expected = "already approved")]
+    fn test_duplicate_approval_rejected() {
+        let (env, s1, client) = setup_two_signers();
+        let hash = BytesN::from_array(&env, &[2u8; 32]);
+        client.approve_upgrade(&s1, &hash);
+        client.approve_upgrade(&s1, &hash);
     }
 }
