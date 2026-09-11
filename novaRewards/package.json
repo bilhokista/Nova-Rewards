@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "NovaRewards — blockchain-powered loyalty rewards on Stellar",
   "private": true,
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "workspaces": [
     "backend",
     "frontend",

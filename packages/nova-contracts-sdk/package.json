@@ -2,6 +2,9 @@
   "name": "@nova-rewards/contracts-sdk",
   "version": "1.0.0",
   "description": "TypeScript bindings for Nova Rewards Soroban smart contracts.",
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "files": ["dist", "src"],

@@ -2,6 +2,9 @@
   "name": "nova-rewards-blockchain",
   "version": "1.0.0",
   "description": "NovaRewards Stellar blockchain layer",
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "main": "stellarService.js",
   "dependencies": {
     "dotenv": "^17.4.2",

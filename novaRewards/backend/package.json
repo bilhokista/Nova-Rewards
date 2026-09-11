@@ -2,6 +2,9 @@
   "name": "nova-rewards-backend",
   "version": "1.0.0",
   "private": true,
+  "engines": {
+    "node": ">=20.19.0"
+  },
   "description": "NovaRewards backend API",
   "main": "server.js",
   "scripts": {
